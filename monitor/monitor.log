@@ -1,0 +1,6 @@
+2025-08-20 09:20:51,402 - INFO - package: mysql.connector.plugins
+2025-08-20 09:20:51,403 - INFO - plugin_name: mysql_native_password
+2025-08-20 09:20:51,404 - INFO - AUTHENTICATION_PLUGIN_CLASS: MySQLNativePasswordAuthPlugin
+2025-08-20 09:21:00,210 - INFO - package: mysql.connector.plugins
+2025-08-20 09:21:00,211 - INFO - plugin_name: mysql_native_password
+2025-08-20 09:21:00,212 - INFO - AUTHENTICATION_PLUGIN_CLASS: MySQLNativePasswordAuthPlugin

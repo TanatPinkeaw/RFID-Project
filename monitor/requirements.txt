@@ -1,0 +1,7 @@
+tkinter
+mysql-connector-python
+requests
+datetime
+threading
+pyserial
+ctypes
