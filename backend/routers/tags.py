@@ -49,7 +49,12 @@ def _normalize_tag_row(row):
 def _broadcast_tag_update(tag_obj):
     """Broadcast tag update ผ่าน WebSocket"""
     try:
-        manager.queue_message({"type": "tag_update", "tag": tag_obj})
+        # ✅ เปลี่ยนจาก manager.queue_message({"type": "tag_update", "tag": tag_obj})
+        manager.queue_message({
+            "type": "tag_update",
+            "data": tag_obj,  # เปลี่ยนจาก "tag" เป็น "data"
+            "action": "update"
+        })
         logger.info(f"📡 Broadcasted tag update: {tag_obj.get('tag_id')}")
     except Exception as e:
         logger.error(f"Failed to broadcast tag update: {e}")
@@ -167,6 +172,18 @@ def tag_operation(op: TagOp):
                 (op.tag_id, "idle", op.asset_id, ts, ts),
             )
 
+            # ✅ เพิ่ม broadcast สำหรับ register
+            try:
+                manager.broadcast_notification({
+                    "type": "scan",
+                    "title": "ลงทะเบียน Tag ใหม่",
+                    "message": f"ลงทะเบียน Tag {op.tag_id} เรียบร้อยแล้ว",
+                    "priority": "normal",
+                    "timestamp": datetime.now().isoformat()
+                })
+            except Exception as e:
+                logger.error(f"Failed to broadcast register notification: {e}")
+
         elif action == "borrow":
             if not op.borrower:
                 raise HTTPException(status_code=400, detail="Missing borrower name")
@@ -189,6 +206,18 @@ def tag_operation(op: TagOp):
                 message=f"ผู้ใช้ {op.borrower} ยืมทรัพย์สิน Asset ID {aid}",
                 asset_id=aid
             )
+
+            # ✅ เพิ่ม broadcast สำหรับ borrow
+            try:
+                manager.broadcast_notification({
+                    "type": "borrow",
+                    "title": "มีการยืมทรัพย์สิน",
+                    "message": f"ผู้ใช้ {op.borrower} ยืมทรัพย์สิน Asset ID {aid}",
+                    "priority": "normal",
+                    "timestamp": datetime.now().isoformat()
+                })
+            except Exception as e:
+                logger.error(f"Failed to broadcast borrow notification: {e}")
 
         elif action == "return":
             aid = _get_asset_id(cur, op.tag_id)

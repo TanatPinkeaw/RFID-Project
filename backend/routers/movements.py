@@ -5,6 +5,7 @@ from models import Movement
 from routers.notifications import create_notification
 from routers.alerts import check_unauthorized_movement
 import logging
+from ws_manager import manager
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
@@ -107,6 +108,26 @@ def create_movement(m: Movement):
         except Exception as e:
             # ป้องกันไม่ให้การสร้าง alert ทำให้ endpoint ล้ม
             print(f"Warning: check_unauthorized_movement failed: {e}")
+        
+        # ✅ เพิ่ม real-time broadcast
+        try:
+            manager.queue_message({
+                "type": "movement_update",
+                "data": {
+                    "movement_id": new_id,
+                    "asset_id": m.asset_id,
+                    "tag_id": m.tag_id,
+                    "from_location_id": m.from_location_id,
+                    "to_location_id": m.to_location_id,
+                    "timestamp": m.timestamp.isoformat() if m.timestamp else None,
+                    "operator": m.operator,
+                    "event_type": m.event_type,
+                    "asset_name": asset_info.get("asset_name") if asset_info else None
+                }
+            })
+            logger.info(f"✅ Movement update broadcasted: {new_id}")
+        except Exception as e:
+            logger.error(f"❌ Failed to broadcast movement update: {e}")
     finally:
         cur.close(); conn.close()
 

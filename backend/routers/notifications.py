@@ -1,7 +1,7 @@
 import logging
 from fastapi import APIRouter, HTTPException, Query
 from typing import List, Optional
-from config.database import get_db_connection  # ✅ แก้ไข import
+from config.database import get_db_connection  # ✅ เปลี่ยนกลับเป็น config.database
 from pydantic import BaseModel
 from ws_manager import manager
 import asyncio
@@ -12,14 +12,22 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/notifications", tags=["notifications"])
 
 def _open_dict_cursor():
+    """เปิด cursor แบบ dictionary จาก config.database"""
     conn = get_db_connection()
-    cur = conn.cursor(dictionary=True)
+    # ตรวจสอบว่าเป็น MySQL หรือ SQLite
+    if hasattr(conn, 'cursor'):
+        # MySQL
+        cur = conn.cursor(dictionary=True)
+    else:
+        # SQLite หรือ database อื่น
+        cur = conn.cursor()
+        cur.row_factory = lambda cursor, row: {
+            col[0]: row[idx] for idx, col in enumerate(cursor.description)
+        }
     return conn, cur
 
 def create_notification(type: str, title: str, message: str, asset_id=None, user_id=None, location_id=None, related_id=None, priority="normal"):
-    """สร้าง notification ใหม่และ broadcast ผ่าน WebSocket
-       ป้องกันการสร้าง alert ที่ไม่เกี่ยวกับ unauthorized/overdue ด้วย heuristic
-    """
+    """สร้าง notification ใหม่และ broadcast ผ่าน WebSocket (Thread-safe)"""
     try:
         conn, cur = _open_dict_cursor()
         try:
@@ -31,33 +39,77 @@ def create_notification(type: str, title: str, message: str, asset_id=None, user
                     "overdue", "เกินกำหนด", "เกินกำหนดคืน", "เกินกำหนด คืน", "เกินกำหนดคืน"
                 ]
                 if related_id is None and not any(k in msg_l for k in allowed_keywords):
-                    # ไม่สร้าง alert ถ้าไม่ตรงเงื่อนไข — ปรับเป็น movement เพื่อไม่ให้หายไปเลย (optional)
-                    # คุณสามารถเปลี่ยนเป็น `return None` เพื่อข้ามการสร้างได้
                     type = "movement"
 
-            # ป้องกัน duplicate (simple): message ช่วงแรกภายใน cooldown ไม่สร้างซ้ำ
+            # ป้องกัน duplicate - แก้ไข SQL สำหรับ database ที่แตกต่างกัน
             cooldown_seconds = 30 if type == "alert" else 5
-            cur.execute("""
-                SELECT id FROM notifications
-                WHERE type = %s AND message LIKE %s AND created_at >= (NOW() - INTERVAL %s SECOND)
-                LIMIT 1
-            """, (type, f"%{(message or '')[:60]}%", cooldown_seconds))
+            
+            # ตรวจสอบประเภทของ database
+            db_type = getattr(conn, 'get_server_info', lambda: 'sqlite')()
+            if 'mysql' in db_type.lower() or hasattr(conn, 'get_server_info'):
+                # MySQL syntax
+                cur.execute("""
+                    SELECT id FROM notifications
+                    WHERE type = %s AND message LIKE %s AND created_at >= (NOW() - INTERVAL %s SECOND)
+                    LIMIT 1
+                """, (type, f"%{(message or '')[:60]}%", cooldown_seconds))
+            else:
+                # SQLite syntax
+                cur.execute("""
+                    SELECT id FROM notifications
+                    WHERE type = ? AND message LIKE ? AND created_at >= datetime('now', '-' || ? || ' seconds')
+                    LIMIT 1
+                """, (type, f"%{(message or '')[:60]}%", cooldown_seconds))
+            
             if cur.fetchone():
                 logger.debug("Skipping duplicate notification insert (type=%s, msg=%s)", type, (message or "")[:60])
                 return None
 
-            cur.execute("""
-                INSERT INTO notifications
-                (type, title, message, asset_id, user_id, location_id, related_id, priority, created_at)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW())
-            """, (type, title, message, asset_id, user_id, location_id, related_id, priority))
+            # Insert notification - แก้ไข SQL สำหรับ database ที่แตกต่างกัน
+            if 'mysql' in db_type.lower() or hasattr(conn, 'get_server_info'):
+                # MySQL syntax
+                cur.execute("""
+                    INSERT INTO notifications
+                    (type, title, message, asset_id, user_id, location_id, related_id, priority, created_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW())
+                """, (type, title, message, asset_id, user_id, location_id, related_id, priority))
+            else:
+                # SQLite syntax
+                cur.execute("""
+                    INSERT INTO notifications
+                    (type, title, message, asset_id, user_id, location_id, related_id, priority, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+                """, (type, title, message, asset_id, user_id, location_id, related_id, priority))
+            
             conn.commit()
             notif_id = cur.lastrowid
 
             # อ่าน row ที่เพิ่งสร้าง สำหรับ broadcast
-            cur.execute("SELECT id as notif_id, type, title, message, asset_id, user_id, location_id, related_id, is_read, is_acknowledged, priority, created_at FROM notifications WHERE id = %s", (notif_id,))
+            if 'mysql' in db_type.lower() or hasattr(conn, 'get_server_info'):
+                # MySQL syntax
+                placeholder = "%s"
+            else:
+                # SQLite syntax
+                placeholder = "?"
+
+            cur.execute(f"""
+                SELECT id as notif_id, type, title, message, asset_id, user_id, location_id, 
+                       related_id, is_read, is_acknowledged, priority, created_at 
+                FROM notifications WHERE id = {placeholder}
+            """, (notif_id,))
             row = cur.fetchone()
+            
             if row:
+                # แปลง datetime สำหรับ JSON serialization
+                created_at = row.get("created_at")
+                if created_at:
+                    if hasattr(created_at, 'isoformat'):
+                        timestamp = created_at.isoformat()
+                    else:
+                        timestamp = str(created_at)
+                else:
+                    timestamp = datetime.now().isoformat()
+                
                 payload = {
                     "notif_id": row.get("notif_id"),
                     "type": row.get("type"),
@@ -70,13 +122,18 @@ def create_notification(type: str, title: str, message: str, asset_id=None, user
                     "is_read": bool(row.get("is_read")),
                     "is_acknowledged": bool(row.get("is_acknowledged")),
                     "priority": row.get("priority"),
-                    "timestamp": row.get("created_at").isoformat() if row.get("created_at") else None
+                    "timestamp": timestamp
                 }
+                
+                # ✅ ใช้ queue_message (thread-safe)
                 try:
                     manager.queue_message(payload)
-                except Exception:
-                    logger.exception("Failed to queue websocket broadcast")
+                    logger.info(f"✅ Notification queued for broadcast: {payload['type']} - {payload['title']}")
+                except Exception as e:
+                    logger.exception(f"❌ Failed to queue websocket broadcast: {e}")
+                    
             return notif_id
+            
         finally:
             cur.close()
             conn.close()
@@ -90,6 +147,7 @@ def ping_notifications():
     return {
         "message": "Notifications router is working",
         "router_prefix": "/api/notifications",
+        "database": "config.database",  # ✅ ระบุว่าใช้ config database
         "available_endpoints": [
             "GET /api/notifications",
             "GET /api/notifications/stats", 
@@ -103,24 +161,43 @@ def ping_notifications():
 def debug_table():
     """ตรวจสอบสถานะ table และแก้ไขหากจำเป็น"""
     try:
-        
         conn, cur = _open_dict_cursor()
         try:
+            # ตรวจสอบ database type
+            db_type = getattr(conn, 'get_server_info', lambda: 'sqlite')()
+            
             # ตรวจสอบ table structure
-            cur.execute("DESCRIBE notifications")
-            columns = cur.fetchall()
+            if 'mysql' in db_type.lower() or hasattr(conn, 'get_server_info'):
+                # MySQL syntax
+                cur.execute("DESCRIBE notifications")
+                columns = cur.fetchall()
+                column_info = [{"name": col["Field"], "type": col["Type"], "null": col["Null"]} for col in columns]
+            else:
+                # SQLite syntax
+                cur.execute("PRAGMA table_info(notifications)")
+                columns = cur.fetchall()
+                column_info = [{"name": col["name"], "type": col["type"], "null": "YES" if col["notnull"] == 0 else "NO"} for col in columns]
             
             # นับจำนวนข้อมูล
             cur.execute("SELECT COUNT(*) as count FROM notifications")
-            count = cur.fetchone()['count']
+            count_result = cur.fetchone()
+            count = count_result['count'] if count_result else 0
             
             # ดูข้อมูล 5 รายการล่าสุด
             cur.execute("SELECT * FROM notifications ORDER BY created_at DESC LIMIT 5")
             recent = cur.fetchall()
             
+            # แปลง datetime objects เป็น string สำหรับ JSON
+            for item in recent:
+                if isinstance(item, dict):
+                    for key, value in item.items():
+                        if hasattr(value, 'isoformat'):
+                            item[key] = value.isoformat()
+            
             return {
                 "table_exists": True,
-                "columns": [{"name": col["Field"], "type": col["Type"], "null": col["Null"]} for col in columns],
+                "database_type": db_type,
+                "columns": column_info,
                 "total_count": count,
                 "recent_notifications": recent
             }
@@ -131,6 +208,7 @@ def debug_table():
         logger.error(f"Debug table error: {e}")
         return {
             "table_exists": False,
+            "database_type": "unknown",
             "error": str(e)
         }
 
@@ -146,8 +224,12 @@ def get_notifications(
             where_conditions = []
             params = []
             
+            # ตรวจสอบ database type สำหรับ placeholder
+            db_type = getattr(conn, 'get_server_info', lambda: 'sqlite')()
+            placeholder = "%s" if 'mysql' in db_type.lower() or hasattr(conn, 'get_server_info') else "?"
+
             if type and type.strip() and type.lower() != "all":
-                where_conditions.append("type = %s")
+                where_conditions.append(f"type = {placeholder}")
                 params.append(type.lower())
             
             if unread_only:
@@ -163,12 +245,11 @@ def get_notifications(
                        COALESCE(related_id, 0) as related_id,
                        is_read, is_acknowledged, priority,
                        created_at as timestamp,
-                       read_at, acknowledged_at,
-                       CONCAT('NOTIF_', id) as tag_id
+                       read_at, acknowledged_at
                 FROM notifications
                 {where_clause}
                 ORDER BY created_at DESC
-                LIMIT %s
+                LIMIT {placeholder}
             """
             params.append(limit)
             
@@ -177,12 +258,15 @@ def get_notifications(
             
             # แปลง datetime objects เป็น string
             for result in results:
-                if result['timestamp']:
-                    result['timestamp'] = result['timestamp'].isoformat()
-                if result['read_at']:
-                    result['read_at'] = result['read_at'].isoformat()
-                if result['acknowledged_at']:
-                    result['acknowledged_at'] = result['acknowledged_at'].isoformat()
+                if isinstance(result, dict):
+                    for key in ['timestamp', 'read_at', 'acknowledged_at']:
+                        if result.get(key) and hasattr(result[key], 'isoformat'):
+                            result[key] = result[key].isoformat()
+                        elif result.get(key):
+                            result[key] = str(result[key])
+                
+                # เพิ่ม tag_id สำหรับ compatibility
+                result['tag_id'] = f"NOTIF_{result['notif_id']}"
             
             return results
         finally:
@@ -200,11 +284,13 @@ def get_notification_stats():
         try:
             # นับทั้งหมด
             cur.execute("SELECT COUNT(*) as total FROM notifications")
-            total = cur.fetchone()['total']
+            total_result = cur.fetchone()
+            total = total_result['total'] if total_result else 0
             
             # นับที่ยังไม่ acknowledge
             cur.execute("SELECT COUNT(*) as unread FROM notifications WHERE is_acknowledged = FALSE")
-            unread = cur.fetchone()['unread']
+            unread_result = cur.fetchone()
+            unread = unread_result['unread'] if unread_result else 0
             
             # นับตาม type (ยังไม่ acknowledge)
             cur.execute("""
@@ -301,24 +387,67 @@ def create_test_notifications():
         # ใช้ direct SQL แทน function เพื่อให้แน่ใจ
         conn, cur = _open_dict_cursor()
         try:
+            # ตรวจสอบ database type
+            db_type = getattr(conn, 'get_server_info', lambda: 'sqlite')()
+            placeholder = "%s" if 'mysql' in db_type.lower() or hasattr(conn, 'get_server_info') else "?"
+
             for i, notif in enumerate(test_notifications):
                 try:
-                    cur.execute("""
-                        INSERT INTO notifications 
-                        (type, title, message, asset_id, user_id, location_id, related_id, priority, created_at)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW())
-                    """, (
-                        notif['type'],
-                        notif['title'], 
-                        notif['message'],
-                        notif.get('asset_id'),
-                        notif.get('user_id'),
-                        notif.get('location_id'),
-                        notif.get('related_id'),
-                        notif.get('priority', 'normal')
-                    ))
+                    if 'mysql' in db_type.lower() or hasattr(conn, 'get_server_info'):
+                        # MySQL syntax
+                        cur.execute(f"""
+                            INSERT INTO notifications 
+                            (type, title, message, asset_id, user_id, location_id, related_id, priority, created_at)
+                            VALUES ({placeholder}, {placeholder}, {placeholder}, {placeholder}, {placeholder}, {placeholder}, {placeholder}, {placeholder}, NOW())
+                        """, (
+                            notif['type'],
+                            notif['title'], 
+                            notif['message'],
+                            notif.get('asset_id'),
+                            notif.get('user_id'),
+                            notif.get('location_id'),
+                            notif.get('related_id'),
+                            notif.get('priority', 'normal')
+                        ))
+                    else:
+                        # SQLite syntax
+                        cur.execute(f"""
+                            INSERT INTO notifications 
+                            (type, title, message, asset_id, user_id, location_id, related_id, priority, created_at)
+                            VALUES ({placeholder}, {placeholder}, {placeholder}, {placeholder}, {placeholder}, {placeholder}, {placeholder}, {placeholder}, datetime('now'))
+                        """, (
+                            notif['type'],
+                            notif['title'], 
+                            notif['message'],
+                            notif.get('asset_id'),
+                            notif.get('user_id'),
+                            notif.get('location_id'),
+                            notif.get('related_id'),
+                            notif.get('priority', 'normal')
+                        ))
+                    
                     created_count += 1
                     logger.info(f"✅ Created test notification {i+1}: {notif['title']}")
+                    
+                    # ส่ง real-time notification
+                    try:
+                        manager.queue_message({
+                            "notif_id": cur.lastrowid,
+                            "type": notif['type'],
+                            "title": notif['title'],
+                            "message": notif['message'],
+                            "asset_id": notif.get('asset_id'),
+                            "user_id": notif.get('user_id'),
+                            "location_id": notif.get('location_id'),
+                            "related_id": notif.get('related_id'),
+                            "is_read": False,
+                            "is_acknowledged": False,
+                            "priority": notif.get('priority', 'normal'),
+                            "timestamp": datetime.now().isoformat()
+                        })
+                    except Exception as ws_e:
+                        logger.warning(f"Failed to send real-time notification: {ws_e}")
+                        
                 except Exception as e:
                     error_msg = f"❌ Error creating notification {i+1}: {str(e)}"
                     errors.append(error_msg)
@@ -350,16 +479,31 @@ def acknowledge_notification(notification_id: int):
     try:
         conn, cur = _open_dict_cursor()
         try:
-            cur.execute("""
-                UPDATE notifications 
-                SET is_read = TRUE, is_acknowledged = TRUE, 
-                    read_at = COALESCE(read_at, NOW()),
-                    acknowledged_at = NOW()
-                WHERE id = %s AND is_acknowledged = FALSE
-            """, (notification_id,))
+            # ตรวจสอบ database type
+            db_type = getattr(conn, 'get_server_info', lambda: 'sqlite')()
+            placeholder = "%s" if 'mysql' in db_type.lower() or hasattr(conn, 'get_server_info') else "?"
+
+            if 'mysql' in db_type.lower() or hasattr(conn, 'get_server_info'):
+                # MySQL syntax
+                cur.execute(f"""
+                    UPDATE notifications 
+                    SET is_read = TRUE, is_acknowledged = TRUE, 
+                        read_at = COALESCE(read_at, NOW()),
+                        acknowledged_at = NOW()
+                    WHERE id = {placeholder} AND is_acknowledged = FALSE
+                """, (notification_id,))
+            else:
+                # SQLite syntax
+                cur.execute(f"""
+                    UPDATE notifications 
+                    SET is_read = 1, is_acknowledged = 1, 
+                        read_at = COALESCE(read_at, datetime('now')),
+                        acknowledged_at = datetime('now')
+                    WHERE id = {placeholder} AND is_acknowledged = 0
+                """, (notification_id,))
             
             if cur.rowcount == 0:
-                cur.execute("SELECT id FROM notifications WHERE id = %s", (notification_id,))
+                cur.execute(f"SELECT id FROM notifications WHERE id = {placeholder}", (notification_id,))
                 if cur.fetchone():
                     return {"message": "Notification already acknowledged"}
                 else:
@@ -381,7 +525,11 @@ def delete_notification(notification_id: int):
     try:
         conn, cur = _open_dict_cursor()
         try:
-            cur.execute("DELETE FROM notifications WHERE id = %s", (notification_id,))
+            # ตรวจสอบ database type
+            db_type = getattr(conn, 'get_server_info', lambda: 'sqlite')()
+            placeholder = "%s" if 'mysql' in db_type.lower() or hasattr(conn, 'get_server_info') else "?"
+
+            cur.execute(f"DELETE FROM notifications WHERE id = {placeholder}", (notification_id,))
             
             if cur.rowcount == 0:
                 raise HTTPException(status_code=404, detail="Notification not found")
@@ -403,13 +551,27 @@ def acknowledge_all_notifications():
     try:
         conn, cur = _open_dict_cursor()
         try:
-            cur.execute("""
-                UPDATE notifications 
-                SET is_read = TRUE, is_acknowledged = TRUE, 
-                    read_at = COALESCE(read_at, NOW()),
-                    acknowledged_at = NOW()
-                WHERE is_acknowledged = FALSE
-            """)
+            # ตรวจสอบ database type
+            db_type = getattr(conn, 'get_server_info', lambda: 'sqlite')()
+            
+            if 'mysql' in db_type.lower() or hasattr(conn, 'get_server_info'):
+                # MySQL syntax
+                cur.execute("""
+                    UPDATE notifications 
+                    SET is_read = TRUE, is_acknowledged = TRUE, 
+                        read_at = COALESCE(read_at, NOW()),
+                        acknowledged_at = NOW()
+                    WHERE is_acknowledged = FALSE
+                """)
+            else:
+                # SQLite syntax
+                cur.execute("""
+                    UPDATE notifications 
+                    SET is_read = 1, is_acknowledged = 1, 
+                        read_at = COALESCE(read_at, datetime('now')),
+                        acknowledged_at = datetime('now')
+                    WHERE is_acknowledged = 0
+                """)
             
             affected_rows = cur.rowcount
             conn.commit()
@@ -439,6 +601,10 @@ def bulk_delete_notifications_post(request: BulkDeleteRequest):
         
         conn, cur = _open_dict_cursor()
         try:
+            # ตรวจสอบ database type
+            db_type = getattr(conn, 'get_server_info', lambda: 'sqlite')()
+            placeholder = "%s" if 'mysql' in db_type.lower() or hasattr(conn, 'get_server_info') else "?"
+
             where_conditions = []
             params = []
             
@@ -448,7 +614,7 @@ def bulk_delete_notifications_post(request: BulkDeleteRequest):
                 type_lower = str(request.type).lower().strip()
                 
                 if type_lower in valid_types:
-                    where_conditions.append("type = %s")
+                    where_conditions.append(f"type = {placeholder}")
                     params.append(type_lower)
                     logger.info(f"Added type filter: {type_lower}")
                 else:
@@ -459,7 +625,10 @@ def bulk_delete_notifications_post(request: BulkDeleteRequest):
             
             # ตรวจสอบ unread_only parameter
             if request.unread_only:
-                where_conditions.append("is_acknowledged = FALSE")
+                if 'mysql' in db_type.lower() or hasattr(conn, 'get_server_info'):
+                    where_conditions.append("is_acknowledged = FALSE")
+                else:
+                    where_conditions.append("is_acknowledged = 0")
                 logger.info("Added unread_only filter")
             
             # สร้าง WHERE clause
@@ -470,7 +639,8 @@ def bulk_delete_notifications_post(request: BulkDeleteRequest):
             # นับก่อนลบ
             count_query = f"SELECT COUNT(*) as count FROM notifications{where_clause}"
             cur.execute(count_query, params)
-            count_before = cur.fetchone()['count']
+            count_result = cur.fetchone()
+            count_before = count_result['count'] if count_result else 0
             
             if count_before == 0:
                 return {
@@ -534,10 +704,75 @@ async def test_realtime():
         "timestamp": datetime.now().isoformat()
     }
     
-    await manager.broadcast_json(test_notification)
+    # ✅ ใช้ queue_message แทน broadcast_json
+    try:
+        manager.queue_message(test_notification)
+        logger.info(f"✅ Test real-time notification queued: {test_notification}")
+    except Exception as e:
+        logger.error(f"❌ Failed to queue test notification: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to send test notification: {str(e)}")
     
     return {
         "success": True,
         "message": "ส่งข้อความทดสอบแล้ว",
-        "payload": test_notification
+        "payload": test_notification,
+        "database": "config.database"  # ✅ ระบุว่าใช้ config database
     }
+
+# เพิ่ม endpoint ทดสอบการสร้าง notification
+@router.post("/create-test")
+def create_test_notification():
+    """สร้าง notification ทดสอบผ่าน create_notification function"""
+    notif_id = create_notification(
+        type="scan",
+        title="🔍 ทดสอบการสร้าง Notification",
+        message=f"ทดสอบเวลา {datetime.now().strftime('%H:%M:%S')}",
+        asset_id=1,
+        location_id=1,
+        priority="normal"
+    )
+    
+    if notif_id:
+        return {
+            "success": True,
+            "message": f"สร้าง notification สำเร็จ ID: {notif_id}",
+            "notif_id": notif_id,
+            "database": "config.database"  # ✅ ระบุว่าใช้ config database
+        }
+    else:
+        return {
+            "success": False,
+            "message": "ไม่สามารถสร้าง notification ได้",
+            "database": "config.database"
+        }
+
+# เพิ่ม endpoint ทดสอบการเชื่อมต่อ database
+@router.get("/debug/connection")
+def test_database_connection():
+    """ทดสอบการเชื่อมต่อ config.database"""
+    try:
+        conn, cur = _open_dict_cursor()
+        try:
+            # ทดสอบ query พื้นฐาน
+            cur.execute("SELECT 1 as test")
+            result = cur.fetchone()
+            
+            # ตรวจสอบ database type
+            db_type = getattr(conn, 'get_server_info', lambda: 'sqlite')()
+            
+            return {
+                "success": True,
+                "message": "การเชื่อมต่อ config.database สำเร็จ",
+                "database_type": db_type,
+                "test_query": result
+            }
+        finally:
+            cur.close()
+            conn.close()
+    except Exception as e:
+        logger.error(f"Database connection test failed: {e}")
+        return {
+            "success": False,
+            "message": f"การเชื่อมต่อ config.database ล้มเหลว: {str(e)}",
+            "error": str(e)
+        }

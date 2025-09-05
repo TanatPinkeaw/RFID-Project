@@ -1,79 +1,58 @@
 """
-WebSocket Manager - จัดการการเชื่อมต่อ WebSocket
-===============================================
-
-ไฟล์นี้จัดการการเชื่อมต่อ WebSocket สำหรับการส่งข้อมูล real-time
-ไปยัง client ต่างๆ เช่น การแจ้งเตือน, สถานะการสแกน, ข้อมูลสินทรัพย์
-
-คุณสมบัติหลัก:
-- จัดการการเชื่อมต่อหลาย client พร้อมกัน
-- ส่งข้อความไปยัง client ทั้งหมดหรือเฉพาะกลุ่ม
-- จัดการการตัดการเชื่อมต่ออัตโนมัติ
-- Background task สำหรับส่งข้อมูลตามเวลา
-
-การใช้งาน:
-- import manager จากไฟล์นี้
-- ใช้ manager.broadcast() เพื่อส่งข้อความไปทุก client
-- ใช้ manager.send_to_client() เพื่อส่งไปยัง client เฉพาะ
+WebSocket Manager - Enhanced Real-time Support with Thread Safety
+==============================================================
 """
 
 import asyncio
 import json
 import logging
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional, Set
 from fastapi import WebSocket
 from datetime import datetime
+import weakref
+import threading
+from fastapi.encoders import jsonable_encoder
 
 logger = logging.getLogger(__name__)
 
 class WebSocketManager:
-    """
-    จัดการการเชื่อมต่อ WebSocket และการส่งข้อความ
-    
-    Attributes:
-        connections (List[WebSocket]): รายการการเชื่อมต่อที่ active
-        client_info (Dict): ข้อมูลเพิ่มเติมของ client แต่ละตัว
-        background_task: Background task สำหรับการทำงานประจำ
-    """
+    """Enhanced WebSocket Manager with better real-time support and thread safety"""
     
     def __init__(self):
-        """
-        สร้าง WebSocketManager ใหม่
-        """
-        self.connections: List[WebSocket] = []  # รายการการเชื่อมต่อ active
-        self.client_info: Dict[str, Dict] = {}  # ข้อมูล client (key = client_id)
-        self.background_task = None  # Background task instance
+        self.active_connections: Set[WebSocket] = set()
+        self.client_info: Dict[str, Dict] = {}
+        self._queue: Optional[asyncio.Queue] = None
+        self._bg_task: Optional[asyncio.Task] = None
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._running = False
+        self._send_timeout = 5.0  # seconds per client send
         logger.info("WebSocketManager initialized")
 
     async def connect(self, websocket: WebSocket, client_id: str = None):
-        """
-        เพิ่มการเชื่อมต่อ WebSocket ใหม่
-        
-        Args:
-            websocket (WebSocket): WebSocket connection object
-            client_id (str, optional): ID ของ client (auto-generate ถ้าไม่ระบุ)
-        """
+        """เชื่อมต่อ WebSocket"""
         try:
-            # รับการเชื่อมต่อ
+            # Initialize queue/task on first connection using running loop
+            if self._queue is None:
+                self._loop = asyncio.get_running_loop()
+                self._queue = asyncio.Queue()
+                self._bg_task = self._loop.create_task(self._broadcast_loop())
+                self._running = True
+                logger.info("WebSocket background task started")
+            
             await websocket.accept()
+            self.active_connections.add(websocket)
             
-            # เพิ่มเข้ารายการ
-            self.connections.append(websocket)
-            
-            # สร้าง client_id ถ้าไม่มี
             if not client_id:
-                client_id = f"client_{len(self.connections)}_{datetime.now().strftime('%H%M%S')}"
+                client_id = f"client_{len(self.active_connections)}_{datetime.now().strftime('%H%M%S')}"
             
-            # เก็บข้อมูล client
             self.client_info[client_id] = {
                 'websocket': websocket,
                 'connected_at': datetime.now(),
                 'client_address': websocket.client.host if websocket.client else 'unknown'
             }
             
-            # Log การเชื่อมต่อ
             client_address = websocket.client.host if websocket.client else 'unknown'
-            logger.info(f"WebSocket connected (client={client_address}). Total connections: {len(self.connections)}")
+            logger.info(f"WebSocket connected (client={client_address}). Total: {len(self.active_connections)}")
             
             # ส่งข้อความต้อนรับ
             await self.send_to_websocket(websocket, {
@@ -82,30 +61,19 @@ class WebSocketManager:
                 'message': 'Connected to RFID Management System',
                 'server_time': datetime.now().isoformat()
             })
-            
-            # เริ่ม background task ถ้ายังไม่มี
-            if not self.background_task:
-                self.background_task = asyncio.create_task(self._background_task())
-                logger.info("WebSocket background task started")
                 
         except Exception as e:
             logger.error(f"Failed to connect WebSocket: {e}")
-            if websocket in self.connections:
-                self.connections.remove(websocket)
+            if websocket in self.active_connections:
+                self.active_connections.discard(websocket)
 
     def disconnect(self, websocket: WebSocket):
-        """
-        ตัดการเชื่อมต่อ WebSocket
-        
-        Args:
-            websocket (WebSocket): WebSocket connection ที่จะตัด
-        """
+        """ตัดการเชื่อมต่อ WebSocket"""
         try:
-            # ลบจากรายการ
-            if websocket in self.connections:
-                self.connections.remove(websocket)
+            client = websocket.client if hasattr(websocket, "client") else None
+            self.active_connections.discard(websocket)
             
-            # ลบจากข้อมูล client
+            # ลบข้อมูล client
             client_id_to_remove = None
             for client_id, info in self.client_info.items():
                 if info['websocket'] == websocket:
@@ -115,160 +83,213 @@ class WebSocketManager:
             if client_id_to_remove:
                 del self.client_info[client_id_to_remove]
             
-            # Log การตัดการเชื่อมต่อ
-            logger.info(f"WebSocket disconnected. Remaining connections: {len(self.connections)}")
+            logger.info(f"WebSocket disconnected (client={client}). Remaining: {len(self.active_connections)}")
             
-            # หยุด background task ถ้าไม่มี connection แล้ว
-            if len(self.connections) == 0 and self.background_task:
-                self.background_task.cancel()
-                self.background_task = None
+            # หยุด background task ถ้าไม่มี connection
+            if len(self.active_connections) == 0:
+                self._running = False
+                if self._bg_task and not self._bg_task.done():
+                    self._bg_task.cancel()
                 logger.info("WebSocket background task stopped")
                 
+            # Ensure socket closed
+            try:
+                if hasattr(websocket, "close") and websocket.client_state:
+                    asyncio.create_task(websocket.close())
+            except Exception:
+                pass
+                
         except Exception as e:
-            logger.error(f"Error during WebSocket disconnect: {e}")
+            logger.error(f"Error during disconnect: {e}")
 
     async def send_to_websocket(self, websocket: WebSocket, data: Dict[Any, Any]):
-        """
-        ส่งข้อความไปยัง WebSocket เฉพาะตัว
-        
-        Args:
-            websocket (WebSocket): WebSocket ที่จะส่งข้อความไป
-            data (Dict): ข้อมูลที่จะส่ง
-        """
+        """ส่งข้อความไปยัง WebSocket เฉพาะตัว"""
         try:
-            # เพิ่ม timestamp
             data['timestamp'] = datetime.now().isoformat()
-            
-            # ส่งข้อความ
-            await websocket.send_text(json.dumps(data, ensure_ascii=False))
+            message = json.dumps(data, ensure_ascii=False, default=str)
+            await websocket.send_text(message)
             
         except Exception as e:
-            logger.error(f"Failed to send message to WebSocket: {e}")
-            # ลบ connection ที่เสีย
-            if websocket in self.connections:
-                self.disconnect(websocket)
-
-    async def broadcast(self, data: Dict[Any, Any]):
-        """
-        ส่งข้อความไปยัง client ทั้งหมด
-        
-        Args:
-            data (Dict): ข้อมูลที่จะส่งไปทุก client
-        """
-        if not self.connections:
-            logger.debug("No WebSocket connections to broadcast to")
-            return
-        
-        logger.debug(f"Broadcasting to {len(self.connections)} connections")
-        
-        # ส่งไปทุก connection
-        disconnected_websockets = []
-        for websocket in self.connections:
-            try:
-                await self.send_to_websocket(websocket, data)
-            except Exception as e:
-                logger.error(f"Failed to broadcast to a connection: {e}")
-                disconnected_websockets.append(websocket)
-        
-        # ลบ connection ที่เสีย
-        for websocket in disconnected_websockets:
+            logger.error(f"Failed to send to WebSocket: {e}")
             self.disconnect(websocket)
 
-    async def send_notification(self, notification_data: Dict[Any, Any]):
-        """
-        ส่งการแจ้งเตือนไปยัง client ทั้งหมด
+    async def broadcast(self, data: Dict[Any, Any]):
+        """ส่งข้อความไปยัง client ทั้งหมด (Async version)"""
+        if not self.active_connections:
+            logger.debug("No connections to broadcast to")
+            return
         
-        Args:
-            notification_data (Dict): ข้อมูลการแจ้งเตือน
-        """
-        message = {
-            'type': 'notification',
-            'data': notification_data
-        }
-        await self.broadcast(message)
-
-    async def send_scan_result(self, scan_data: Dict[Any, Any]):
-        """
-        ส่งผลการสแกน RFID ไปยัง client ทั้งหมด
+        logger.debug(f"Broadcasting to {len(self.active_connections)} connections: {data.get('type', 'unknown')}")
         
-        Args:
-            scan_data (Dict): ข้อมูลผลการสแกน
-        """
-        message = {
-            'type': 'scan_result',
-            'data': scan_data
-        }
-        await self.broadcast(message)
+        # เพิ่มเข้า queue สำหรับ background processing
+        if self._queue:
+            await self._queue.put(data.copy())
 
-    async def send_asset_update(self, asset_data: Dict[Any, Any]):
-        """
-        ส่งการอัปเดตข้อมูลสินทรัพย์
-        
-        Args:
-            asset_data (Dict): ข้อมูลสินทรัพย์ที่อัปเดต
-        """
-        message = {
-            'type': 'asset_update',
-            'data': asset_data
-        }
-        await self.broadcast(message)
+    def queue_message(self, payload: dict):
+        """Thread-safe: schedule payload for broadcast on the manager's loop."""
+        if not self._loop or not self._queue:
+            logger.debug("queue_message: no running loop yet, skipping payload type=%s", 
+                        payload.get("type", "<unknown>"))
+            return
+        try:
+            self._loop.call_soon_threadsafe(self._queue.put_nowait, payload)
+            logger.debug("queue_message: scheduled payload type=%s", payload.get("type", "<unknown>"))
+        except Exception:
+            logger.exception("Failed to schedule websocket broadcast")
 
-    async def send_system_status(self, status_data: Dict[Any, Any]):
-        """
-        ส่งสถานะระบบ
-        
-        Args:
-            status_data (Dict): ข้อมูลสถานะระบบ
-        """
-        message = {
-            'type': 'system_status',
-            'data': status_data
-        }
-        await self.broadcast(message)
-
-    def get_connection_count(self) -> int:
-        """
-        ดึงจำนวนการเชื่อมต่อปัจจุบัน
-        
-        Returns:
-            int: จำนวน connection ที่ active
-        """
-        return len(self.connections)
-
-    def get_client_info(self) -> Dict[str, Dict]:
-        """
-        ดึงข้อมูล client ทั้งหมด
-        
-        Returns:
-            Dict: ข้อมูล client ทั้งหมด
-        """
-        return self.client_info.copy()
-
-    async def _background_task(self):
-        """
-        Background task สำหรับการทำงานประจำ
-        เช่น การส่ง heartbeat, การเช็คสถานะ
-        """
-        logger.info("WebSocket background task started")
+    async def _broadcast_loop(self):
+        """Background worker สำหรับประมวลผล messages"""
+        logger.info("Background broadcast loop started")
         
         try:
-            while True:
-                # ส่ง heartbeat ทุก 30 วินาที
-                if self.connections:
-                    heartbeat_data = {
-                        'type': 'heartbeat',
-                        'server_time': datetime.now().isoformat(),
-                        'active_connections': len(self.connections)
-                    }
-                    await self.broadcast(heartbeat_data)
-                
-                # รอ 30 วินาที
-                await asyncio.sleep(30)
-                
-        except asyncio.CancelledError:
-            logger.info("WebSocket background task cancelled")
-        except Exception as e:
-            logger.error(f"Error in WebSocket background task: {e}")
+            while self._running or not self._queue.empty():
+                try:
+                    # รอ message จาก queue
+                    payload = await asyncio.wait_for(self._queue.get(), timeout=1.0)
+                    
+                    try:
+                        payload_type = payload.get("type") if isinstance(payload, dict) else str(type(payload))
+                    except Exception:
+                        payload_type = "<unknown>"
+                    
+                    logger.debug("ws_manager: dequeued payload type=%s", payload_type)
 
-# สร้าง global instance
+                    if not self.active_connections:
+                        logger.debug("No WS clients, skipping broadcast (type=%s)", payload_type)
+                        continue
+
+                    # Make payload JSON-serializable
+                    safe_payload = jsonable_encoder(payload)
+                    text = json.dumps(safe_payload, ensure_ascii=False, separators=(",", ":"))
+
+                    disconnected = []
+                    success_count = 0
+                    
+                    # Send to each connection with timeout
+                    for ws in list(self.active_connections):
+                        client = getattr(ws, "client", None)
+                        try:
+                            # Protect per-client send with timeout
+                            await asyncio.wait_for(ws.send_text(text), timeout=self._send_timeout)
+                            success_count += 1
+                        except asyncio.TimeoutError:
+                            logger.warning("WS send timeout to client=%s (type=%s) -> marking disconnected", 
+                                          client, payload_type)
+                            disconnected.append(ws)
+                        except Exception:
+                            logger.exception("Error sending WS message to client=%s (type=%s). will disconnect", 
+                                           client, payload_type)
+                            disconnected.append(ws)
+
+                    # Remove disconnected clients
+                    for ws in disconnected:
+                        self.disconnect(ws)
+
+                    logger.info("Broadcasted payload type=%s to %d clients (%d failed)", 
+                              payload_type, success_count, len(disconnected))
+                    
+                except asyncio.TimeoutError:
+                    # Send heartbeat every 30 seconds during timeout
+                    if self.active_connections:
+                        await self._send_heartbeat()
+                    continue
+                    
+                except Exception as e:
+                    logger.error(f"Error in broadcast loop: {e}")
+                    await asyncio.sleep(1)
+                    
+        except asyncio.CancelledError:
+            logger.info("Background broadcast loop cancelled")
+        except Exception as e:
+            logger.error(f"Background broadcast loop error: {e}")
+        finally:
+            logger.info("Background broadcast loop stopped")
+
+    async def _send_heartbeat(self):
+        """ส่ง heartbeat"""
+        heartbeat_data = {
+            'type': 'heartbeat',
+            'server_time': datetime.now().isoformat(),
+            'active_connections': len(self.active_connections)
+        }
+        
+        if self._queue:
+            try:
+                await self._queue.put(heartbeat_data)
+            except Exception as e:
+                logger.error(f"Failed to queue heartbeat: {e}")
+
+    # ✅ เพิ่ม convenience methods ที่ใช้ queue_message (thread-safe)
+    def broadcast_scan_result(self, scan_data: Dict[Any, Any]):
+        """ส่งผลการสแกน RFID (Thread-safe)"""
+        self.queue_message({
+            'type': 'scan_result',
+            'data': scan_data
+        })
+
+    def broadcast_notification(self, notification_data: Dict[Any, Any]):
+        """ส่งการแจ้งเตือน (Thread-safe)"""
+        self.queue_message(notification_data)
+
+    def broadcast_asset_update(self, asset_data: Dict[Any, Any]):
+        """ส่งการอัปเดตสินทรัพย์ (Thread-safe)"""
+        self.queue_message({
+            'type': 'asset_update',
+            'data': asset_data
+        })
+
+    def broadcast_movement_update(self, movement_data: Dict[Any, Any]):
+        """ส่งการอัปเดตการเคลื่อนไหว (Thread-safe)"""
+        self.queue_message({
+            'type': 'movement_update',
+            'data': movement_data
+        })
+
+    def broadcast_device_status(self, device_id, status, message=""):
+        """ส่ง notification เมื่อสถานะ device เปลี่ยน (Thread-safe)"""
+        try:
+            notification = {
+                "type": "device_status",
+                "title": f"📡 Device {device_id} Status",
+                "message": f"Device {device_id}: {message}",
+                "device_id": device_id,
+                "status": status,
+                "timestamp": datetime.now().isoformat(),
+                "priority": "high" if status == "offline" else "normal"
+            }
+            self.queue_message(notification)
+        except Exception as e:
+            logger.error(f"Failed to broadcast device status: {e}")
+
+    async def shutdown(self):
+        """Shutdown WebSocket manager cleanly"""
+        try:
+            self._running = False
+            
+            if self._bg_task:
+                self._bg_task.cancel()
+                await self._bg_task
+        except Exception:
+            logger.exception("Error shutting down ws_manager background task")
+        
+        # Close active connections
+        for ws in list(self.active_connections):
+            try:
+                await ws.close()
+            except Exception:
+                pass
+        
+        self.active_connections.clear()
+        self.client_info.clear()
+        logger.info("ws_manager shutdown complete")
+
+    def get_connection_count(self) -> int:
+        """จำนวน connections ปัจจุบัน"""
+        return len(self.active_connections)
+
+    def get_client_info(self) -> Dict[str, Dict]:
+        """ข้อมูล clients ทั้งหมด"""
+        return self.client_info.copy()
+
+# Global instance
 manager = WebSocketManager()

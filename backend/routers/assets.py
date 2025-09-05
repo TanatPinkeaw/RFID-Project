@@ -5,6 +5,7 @@ from models import Asset, AssetDetail, AssetCreate
 from routers.notifications import create_notification
 from ws_manager import manager
 import logging
+from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
@@ -80,7 +81,12 @@ def create_asset(a: AssetCreate):
         try:
             created = _get_asset_or_404(new_id)
             logger.info("assets.py: broadcasting asset_create id=%s", new_id)
-            manager.queue_message({"type": "asset_update", "action": "create", "asset": created})
+            manager.broadcast_asset_update({
+                "action": "created",
+                "asset_id": new_id,
+                "asset_data": created,
+                "timestamp": datetime.now().isoformat()
+            })
         except Exception:
             logger.exception("assets.py: broadcast failed")
 
@@ -150,8 +156,13 @@ def update_asset(asset_id: int, asset_data: AssetCreate):
         updated_asset = cur.fetchone()
         # Broadcast asset update
         try:
-            logger.info("assets.py: broadcasting asset_update id=%s", asset_id)   # <-- เพิ่ม (ใน update endpoint)
-            manager.queue_message({"type": "asset_update", "action": "update", "asset": updated_asset})
+            logger.info("assets.py: broadcasting asset_update id=%s", asset_id)
+            manager.broadcast_asset_update({
+                "action": "updated",
+                "asset_id": asset_id,
+                "asset_data": updated_asset,
+                "timestamp": datetime.now().isoformat()
+            })
         except Exception:
             logger.exception("assets.py: broadcast failed")
         
@@ -180,8 +191,12 @@ def delete_asset(asset_id: int):
         )
         # Broadcast delete
         try:
-            logger.info("assets.py: broadcasting asset_delete id=%s", asset_id)   # <-- เพิ่ม (in delete)
-            manager.queue_message({"type": "asset_update", "action": "delete", "asset_id": asset_id})
+            logger.info("assets.py: broadcasting asset_delete id=%s", asset_id)
+            manager.broadcast_asset_update({
+                "action": "deleted",
+                "asset_id": asset_id,
+                "timestamp": datetime.now().isoformat()
+            })
         except Exception:
             logger.exception("assets.py: broadcast failed")
     finally:

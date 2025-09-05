@@ -3,6 +3,7 @@ from typing import Optional
 from datetime import datetime, timedelta
 from config.database import get_db_connection
 from routers.notifications import create_notification  # ใช้ฟังก์ชันที่มีอยู่
+from ws_manager import manager
 import logging
 
 logger = logging.getLogger(__name__)
@@ -75,6 +76,21 @@ def check_unauthorized_movement(conn=None, cur=None, tag_id: str = None, to_loca
             logger.info(f"Unauthorized movement alert created for tag {tag_id} -> {loc_text}")
         except Exception as e:
             logger.error(f"Failed to create unauthorized alert for {tag_id}: {e}")
+
+        # ✅ เพิ่ม real-time broadcast สำหรับ unauthorized alert
+        try:
+            manager.broadcast_notification({
+                "type": "alert", 
+                "title": title,
+                "message": message,
+                "priority": "high",
+                "tag_id": tag_id,
+                "location_id": to_location_id,
+                "timestamp": datetime.now().isoformat()
+            })
+            logger.info(f"✅ Unauthorized alert broadcasted for tag {tag_id}")
+        except Exception as e:
+            logger.error(f"❌ Failed to broadcast unauthorized alert: {e}")
 
         return True
 

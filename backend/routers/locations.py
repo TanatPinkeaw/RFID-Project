@@ -4,6 +4,10 @@ from datetime import datetime
 from config.database import get_db_connection
 from models import Location, ScanModel, Movement, LocationRead
 from routers.notifications import create_notification
+from ws_manager import manager
+import logging
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/locations", tags=["locations"])
 
@@ -108,6 +112,40 @@ def scan_at_location(location_id: int, s: ScanModel):
                 location_id=location_id
             )
 
+        # ✅ เพิ่ม real-time broadcast สำหรับ scan result
+        try:
+            manager.broadcast_scan_result({
+                "tag_id": s.tag_id,
+                "location_id": location_id,
+                "asset_id": aid,
+                "timestamp": ts.isoformat() if hasattr(ts, 'isoformat') else str(ts),
+                "operator": s.operator,
+                "status": "success",
+                "movement_created": mov_id is not None
+            })
+            logger.info(f"✅ Scan result broadcasted: {s.tag_id} at location {location_id}")
+        except Exception as e:
+            logger.error(f"❌ Failed to broadcast scan result: {e}")
+        
+        # ✅ ถ้ามี movement ให้ broadcast movement update ด้วย
+        if mov_id:
+            try:
+                manager.queue_message({
+                    "type": "movement_update",
+                    "data": {
+                        "movement_id": mov_id,
+                        "asset_id": aid,
+                        "tag_id": s.tag_id,
+                        "from_location_id": prev_loc,
+                        "to_location_id": location_id,
+                        "timestamp": ts.isoformat() if hasattr(ts, 'isoformat') else str(ts),
+                        "operator": s.operator,
+                        "event_type": "enter"
+                    }
+                })
+            except Exception as e:
+                logger.error(f"❌ Failed to broadcast movement update: {e}")
+        
         # 4) คืนผลลัพธ์ (ถ้าไม่มี movement ใหม่ movement_id จะเป็น None)
         return Movement(
             movement_id=mov_id,

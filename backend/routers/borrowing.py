@@ -79,6 +79,7 @@ def _row_to_borrow(row):
 
 @router.post("/borrow")
 def borrow_item(req: BorrowRequest):
+    """ยืมทรัพย์สิน"""
     conn = get_db_connection()
     cur = conn.cursor(dictionary=True)
     now = datetime.utcnow()
@@ -134,7 +135,8 @@ def borrow_item(req: BorrowRequest):
             manager.queue_message({
                 "type": "borrowing_update", 
                 "action": "borrow", 
-                "borrow": borrow
+                "data": borrow,  # เปลี่ยนจาก "borrow" เป็น "data"
+                "timestamp": datetime.now().isoformat()
             })
         except Exception:
             logger.exception("Failed to queue borrowing_update (borrow)")
@@ -143,14 +145,15 @@ def borrow_item(req: BorrowRequest):
         try:
             manager.queue_message({
                 "type": "tag_update",
-                "tag": {
+                "data": {  # เปลี่ยนจาก "tag" เป็น "data"
                     "tag_id": borrow["tag_id"],
                     "asset_id": borrow.get("asset_id"),
                     "authorized": 1,
                     "status": "borrowed",
                     "current_location_id": None,
-                    "last_seen": borrow["borrow_date"]
-                }
+                    "last_seen": borrow["borrow_date"].isoformat() if hasattr(borrow["borrow_date"], 'isoformat') else str(borrow["borrow_date"])
+                },
+                "action": "status_change"
             })
         except Exception:
             logger.exception("Failed to queue tag_update (borrow)")
@@ -174,6 +177,7 @@ def borrow_item(req: BorrowRequest):
 
 @router.post("/return")
 def return_item(req: ReturnRequest):
+    """คืนทรัพย์สิน"""
     conn = get_db_connection()
     cur = conn.cursor(dictionary=True)
     now = datetime.utcnow()
@@ -234,7 +238,8 @@ def return_item(req: ReturnRequest):
             manager.queue_message({
                 "type": "borrowing_update", 
                 "action": "return", 
-                "borrow": borrow
+                "data": borrow,  # เปลี่ยนจาก "borrow" เป็น "data"
+                "timestamp": datetime.now().isoformat()
             })
         except Exception:
             logger.exception("Failed to queue borrowing_update (return)")
@@ -243,14 +248,15 @@ def return_item(req: ReturnRequest):
         try:
             manager.queue_message({
                 "type": "tag_update",
-                "tag": {
+                "data": {  # เปลี่ยนจาก "tag" เป็น "data"
                     "tag_id": borrow["tag_id"],
                     "asset_id": borrow.get("asset_id"),
                     "authorized": 0,
                     "status": "idle",
                     "current_location_id": req.return_location_id,
-                    "last_seen": now
-                }
+                    "last_seen": now.isoformat()
+                },
+                "action": "status_change"
             })
         except Exception:
             logger.exception("Failed to queue tag_update (return)")
